@@ -60,8 +60,8 @@ class SessionsHandler:
 
     def recv(self, sock, addr, packet_number):
         if self.recv_session[sock][addr] == packet_number:
+            ack = PACKET.to_bytes(0xFF, self.recv_session[sock][addr])
             self.recv_session[sock][addr] += 1
-            ack = PACKET.to_bytes(0xFF)
             # Only need to send this once. If he doesn't get it then
             # he'll send the packet again and we'll end up here again.
             ARBITER.send(sock, ack, addr)
@@ -139,13 +139,17 @@ class Arbiter:
         callbacks = self.packet_callbacks[sock]
         while buff[addr] and buff[addr][0] not in callbacks:
             buff[addr] = buff[addr][1:]
+        if not buff[addr]:
+            return
 
         packet_size = PACKET.SIZES[buff[addr][0]]
         if len(buff[addr]) >= packet_size:
             packet = buff[addr][:packet_size]
             buff[addr] = buff[addr][packet_size:]
             args = PACKET.to_tuple(packet[0], packet)
-            callbacks[packet[0]](*args, srcaddr=addr)
+            packet_number, args = args[0], args[1:]
+            if SESS.recv(sock, addr, packet_number):
+                callbacks[packet[0]](*args, srcaddr=addr)
 
 
 ARBITER = Arbiter()
@@ -162,6 +166,7 @@ class Lobby:
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         self.sock.bind(('0.0.0.0', port))
+        SESS.add_sock(self.sock)
         ARBITER.add_sock(self.sock, {0x22: self.add_client})
 
     def add_client(self, srcaddr):
