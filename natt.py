@@ -8,6 +8,7 @@ import time
 import uuid
 
 from collections import defaultdict
+from functools import partial
 
 
 logging.basicConfig(level=logging.INFO)
@@ -54,15 +55,17 @@ class SessionsHandler:
         self.recv_session = {}
         self.send_session = {}
         self.send_queue = {}
+        self.acks = {}
         self._send_retry_loop()
 
     def add_sock(self, sock):
         """Create a "TCP" session for given socket.
         This must be called before using recv/send with
         that socket."""
-        self.recv_session[sock] = defaultdict(int)
+        self.recv_session[sock] = {}
         self.send_session[sock] = defaultdict(int)
         self.send_queue[sock] = defaultdict(list)
+        self.acks[sock] = defaultdict(set)
 
     def recv(self, sock, addr, packet_number):
         """Send an ACK to the sender that we got this packet number.
@@ -70,6 +73,8 @@ class SessionsHandler:
         False otherwise."""
         # Only need to send this once. If he doesn't get it then
         # he'll send the packet again and we'll end up here again.
+        if addr not in self.recv_session[sock]:
+            self.recv_session[sock][addr] = packet_number
         if packet_number <= self.recv_session[sock][addr]:
             ack = PACKET.to_bytes(0xFF, packet_number)
             ARBITER.send(sock, ack, addr)
@@ -82,32 +87,41 @@ class SessionsHandler:
         return False
 
     def recv_ack(self, sock, addr, ack_number):
-        """We should get this when a peer has recv'd
-        and ack'd something we sent out, so increment
-        the send session number."""
-        if ack_number == self.send_session[sock][addr]:
-            self.send_session[sock][addr] += 1
+        """Call this when a peer has recv'd
+        and ack'd something we sent out."""
+        # Add number to this temporary set so that the next time
+        # the send_retry_loop is called it can check this set
+        # and see it has been ACK'd and stop retrying the send.
+        self.acks[sock][addr].add(ack_number)
 
     def _send_retry_loop(self):
         """Retry loop for sending out-going data from the queue."""
+        # TODO checking ever 100ms to see if there is anything to
+        #      send or retry sending is pretty stupid. Need a way
+        #      to seperate the "retry every 100ms" logic from the
+        #      "start sending this for the first time" logic.
         for sock in self.send_queue:
             for dest_addr in self.send_queue[sock]:
                 if not self.send_queue[sock][dest_addr]:
                     # Nothing to send from sock to dest_addr
                     continue
-
                 snum, packet = self.send_queue[sock][dest_addr][0]
-                if snum < self.send_session[sock][dest_addr]:
+
+                if snum in self.acks[sock][dest_addr]:
                     # This packet has already been ACK'd
                     self.send_queue[sock][dest_addr].pop(0)
                     continue
-
                 ARBITER.send(sock, packet, dest_addr)
+
+                # Must clear this set otherwise it could grow infinitely.
+                self.acks[sock][dest_addr].clear()
+
         # Check again in 100ms
         ARBITER.add_timer(self._send_retry_loop, 0.1)
 
     def send(self, sock, dest_addr, packet_type, *args):
         """Use given socket to send packet to destination address."""
+        self.send_session[sock][dest_addr] += 1
         snum = self.send_session[sock][dest_addr]
         packet = PACKET.to_bytes(
             packet_type,
@@ -127,7 +141,7 @@ class Arbiter:
 
     def start(self):
         """Indefinitely handle read/write events of all
-        added sockets."""
+        added sockets and timers."""
         while True:
             timeout = None
             if self.timer_heap:
@@ -178,7 +192,6 @@ class Arbiter:
         for addr, queue in queues.items():
             if queue:
                 to_send = queue.pop(0)
-                # LOG.info("Sending {} to {}".format(to_send, addr))
                 sock.sendto(to_send, addr)
 
     def the_read_cb(self, sock):
@@ -187,25 +200,39 @@ class Arbiter:
         buff = self.all_buffers[sock]
         data, addr = sock.recvfrom(65565)
         buff[addr] += data
+        self.add_timer(partial(self._read_buff, sock), 0)
+
+    def _read_buff(self, sock):
+        buff = self.all_buffers[sock]
+        buff_empty = True
         callbacks = self.packet_callbacks[sock]
-        while buff[addr] and buff[addr][0] not in callbacks:
-            buff[addr] = buff[addr][1:]
-        if not buff[addr]:
-            return
+        # Find a single valid packet to handle
+        for addr in buff:
+            while buff[addr] and buff[addr][0] not in callbacks:
+                buff[addr] = buff[addr][1:]
+            if not buff[addr]:
+                continue
 
-        packet_size = PACKET.SIZES[buff[addr][0]]
-        if len(buff[addr]) >= packet_size:
-            packet = buff[addr][:packet_size]
-            buff[addr] = buff[addr][packet_size:]
-            args = PACKET.to_tuple(packet[0], packet)
-            packet_number, args = args[0], args[1:]
+            packet_size = PACKET.SIZES[buff[addr][0]]
+            if len(buff[addr]) >= packet_size:
+                packet = buff[addr][:packet_size]
+                buff[addr] = buff[addr][packet_size:]
+                args = PACKET.to_tuple(packet[0], packet)
+                packet_number, args = args[0], args[1:]
 
-            if packet[0] == 0xFF:
-                # This was an acknowledgement that they got our packet
-                SESS.recv_ack(sock, addr, packet_number)
-            elif SESS.recv(sock, addr, packet_number):
-                # This was an expected packet. Call associated callback.
-                callbacks[packet[0]](*args, srcaddr=addr)
+                if packet[0] == 0xFF:
+                    # This was an acknowledgement that they got our packet
+                    SESS.recv_ack(sock, addr, packet_number)
+                    buff_empty = False
+                    break
+                elif SESS.recv(sock, addr, packet_number):
+                    # This was an expected packet. Call associated callback.
+                    callbacks[packet[0]](*args, srcaddr=addr)
+                    buff_empty = False
+                    break
+        # call this method again in case there is still more data in buffs
+        if not buff_empty:
+            self.add_timer(partial(self._read_buff, sock), 0)
 
 
 ARBITER = Arbiter()
@@ -283,6 +310,11 @@ class Client:
                 addr,
                 0x11,
                 bytes("Hello neighbor, I'm {}".format(self.uuid), 'utf8'))
+            SESS.send(
+                self.sock,
+                addr,
+                0x11,
+                bytes("Goodbye neighbor", 'utf8'))
 
     def read_string(self, string, **kwargs):
         """Read an arbitrary string from a peer."""
