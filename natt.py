@@ -56,7 +56,7 @@ class SessionsHandler:
         self.send_session = {}
         self.send_queue = {}
         self.acks = {}
-        self._send_retry_loop()
+        self.retry_looping = False
 
     def add_sock(self, sock):
         """Create a "TCP" session for given socket.
@@ -64,7 +64,7 @@ class SessionsHandler:
         that socket."""
         self.recv_session[sock] = {}
         self.send_session[sock] = defaultdict(int)
-        self.send_queue[sock] = defaultdict(list)
+        self.send_queue[sock] = []
         self.acks[sock] = defaultdict(set)
 
     def recv(self, sock, addr, packet_number):
@@ -96,28 +96,22 @@ class SessionsHandler:
 
     def _send_retry_loop(self):
         """Retry loop for sending out-going data from the queue."""
-        # TODO checking ever 100ms to see if there is anything to
-        #      send or retry sending is pretty stupid. Need a way
-        #      to seperate the "retry every 100ms" logic from the
-        #      "start sending this for the first time" logic.
+        self.retry_looping = False
         for sock in self.send_queue:
-            for dest_addr in self.send_queue[sock]:
-                if not self.send_queue[sock][dest_addr]:
-                    # Nothing to send from sock to dest_addr
-                    continue
-                snum, packet = self.send_queue[sock][dest_addr][0]
-
-                if snum in self.acks[sock][dest_addr]:
-                    # This packet has already been ACK'd
-                    self.send_queue[sock][dest_addr].pop(0)
-                    continue
+            # Filter out packets that have already been ACK'd,
+            # we don't need to send them anymore.
+            send_queue = (p
+                          for p in self.send_queue[sock]
+                          if p[1] not in self.acks[sock][p[0]])
+            for dest_addr, snum, packet in send_queue:
                 ARBITER.send(sock, packet, dest_addr)
-
+                self.retry_looping = True
                 # Must clear this set otherwise it could grow infinitely.
                 self.acks[sock][dest_addr].clear()
 
-        # Check again in 100ms
-        ARBITER.add_timer(self._send_retry_loop, 0.1)
+        # If we sent something, try sending it again in 100ms
+        if self.retry_looping:
+            ARBITER.add_timer(self._send_retry_loop, 0.1)
 
     def send(self, sock, dest_addr, packet_type, *args):
         """Use given socket to send packet to destination address."""
@@ -127,7 +121,11 @@ class SessionsHandler:
             packet_type,
             snum,
             *args)
-        self.send_queue[sock][dest_addr].append((snum, packet))
+        self.send_queue[sock].append((dest_addr, snum, packet))
+
+        # If the send/retry loop isn't running, start it
+        if not self.retry_looping:
+            self._send_retry_loop()
 
 
 class Arbiter:
