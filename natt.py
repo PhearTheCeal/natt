@@ -131,7 +131,7 @@ class SessionsHandler:
 
 
 class Arbiter:
-    """Basically libevent."""
+    """Basically the UDP and Timer parts of Libuv."""
     def __init__(self):
         self.sel = selectors.DefaultSelector()
         self.all_queues = {}
@@ -150,10 +150,10 @@ class Arbiter:
             # handle read/write events
             events = self.sel.select(timeout)
             for key, mask in events:
-                callbacks = key.data
-                for event_type, callback in callbacks.items():
-                    if mask & event_type:
-                        callback(key.fileobj)
+                if mask & selectors.EVENT_READ:
+                    self.the_read_cb(key.fileobj)
+                if mask & selectors.EVENT_WRITE:
+                    self.the_write_cb(key.fileobj)
 
             # check heap for timer events
             now = time.time()
@@ -166,7 +166,8 @@ class Arbiter:
 
     def send(self, sock, data, addr):
         """Use given sock to send given data to given address."""
-        self.all_queues[sock][addr].append(data)
+        self.sel.modify(sock, selectors.EVENT_WRITE)
+        self.all_queues[sock].append((addr, data))
 
     def add_timer(self, cb, seconds):
         """Add a callback to be called after given number of seconds."""
@@ -175,24 +176,20 @@ class Arbiter:
     def add_sock(self, sock, packet_cbs):
         """Add socket with callbacks for when the socket reads
         various types of packets."""
-        self.all_queues[sock] = defaultdict(list)
+        self.all_queues[sock] = []
         self.all_buffers[sock] = defaultdict(bytes)
         self.packet_callbacks[sock] = packet_cbs
         packet_cbs[0xFF] = None  # Special ACK callback for sessions
-        mask = selectors.EVENT_READ | selectors.EVENT_WRITE
-        cbs = {
-            selectors.EVENT_READ: self.the_read_cb,
-            selectors.EVENT_WRITE: self.the_write_cb
-        }
-        self.sel.register(sock, mask, cbs)
+        self.sel.register(sock, selectors.EVENT_READ)
 
     def the_write_cb(self, sock):
         """Handles sending outgoing queued data for all sockets."""
-        queues = self.all_queues[sock]
-        for addr, queue in queues.items():
-            if queue:
-                to_send = queue.pop(0)
-                sock.sendto(to_send, addr)
+        queue = self.all_queues[sock]
+        if queue:
+            addr, data = queue.pop(0)
+            sock.sendto(data, addr)
+        if not queue:
+            self.sel.modify(sock, selectors.EVENT_READ)
 
     def the_read_cb(self, sock):
         """Handles reading packets and sending packet data to callbacks
