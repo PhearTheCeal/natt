@@ -66,6 +66,11 @@ class SessionHandler:
         ARBITER.add_sess(self)
 
     def add_callbacks(self, cbs):
+        """Add callbacks for the current session. If a packet
+        comes in with given magic number, its associated callback
+        is called.
+
+        cbs is a dict of magic_num=>func."""
         self.packet_callbacks.update(cbs)
 
     def read_buff(self):
@@ -216,8 +221,7 @@ class Arbiter:
             self.sel.modify(sock, selectors.EVENT_READ)
 
     def the_read_cb(self, sock):
-        """Handles reading packets and sending packet data to callbacks
-        for all sockets."""
+        """Handles reading data from sockets into their session's buffer."""
         sess = self.sock_to_sess[sock]
         buff = sess.recv_buff
         data, addr = sock.recvfrom(65565)
