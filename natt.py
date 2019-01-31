@@ -182,9 +182,9 @@ class Arbiter:
             events = self.sel.select(timeout)
             for key, mask in events:
                 if mask & selectors.EVENT_READ:
-                    self.the_read_cb(key.fileobj)
+                    self._handle_read(key.fileobj)
                 if mask & selectors.EVENT_WRITE:
-                    self.the_write_cb(key.fileobj)
+                    self._handle_write(key.fileobj)
 
             # check heap for timer events
             now = time.time()
@@ -211,8 +211,8 @@ class Arbiter:
         self.all_queues[sess.sock] = []
         self.sel.register(sess.sock, selectors.EVENT_READ)
 
-    def the_write_cb(self, sock):
-        """Handles sending outgoing queued data for all sockets."""
+    def _handle_write(self, sock):
+        """Handles sending outgoing queued data for this socket."""
         queue = self.all_queues[sock]
         if queue:
             addr, data = queue.pop(0)
@@ -220,8 +220,8 @@ class Arbiter:
         if not queue:
             self.sel.modify(sock, selectors.EVENT_READ)
 
-    def the_read_cb(self, sock):
-        """Handles reading data from sockets into their session's buffer."""
+    def _handle_read(self, sock):
+        """Handles reading data from socket into their session's buffer."""
         sess = self.sock_to_sess[sock]
         buff = sess.recv_buff
         data, addr = sock.recvfrom(65565)
